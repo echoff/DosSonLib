@@ -47,6 +47,7 @@ bool settingOK = false;
 void (*nodeLoopPtr)() = NULL;
 void (*customSettingPrt)(char c) = NULL;
 void (*customInfoPrt)() = NULL;
+void (*onMsgPrt)(byte* data, int lenght) = NULL;
 
 void DogSonSetup();
 void DogSonUpdate();
@@ -96,15 +97,23 @@ void DogSonSetup()
 	//设置指令处理回调
 	command.setResolveCommandCallback([](byte* buff, int startIndex, int length) {
 		int endIndex = startIndex + length;
-		Serial.println("receive Command: ");
+		Serial.print("receive Command: ");
 
 		for (int i = startIndex; i < endIndex; i++) {
 			Serial.print(*(buff + i), HEX);
 			Serial.print(" ");
 		}
 		Serial.println("\n");
-		byte data = *(buff + startIndex);
-		if (data == 1)
+
+		byte cmdData[length];
+		memcpy(cmdData, buff + startIndex, length);
+
+		if (onMsgPrt != NULL)
+		{
+			onMsgPrt(cmdData, length);
+		}
+
+		if (length == 1 && cmdData[0] == 1)
 		{
 			byte selfData[1] = { WiFi.RSSI() };
 			command.sendCommand(selfData, 1);
@@ -135,6 +144,21 @@ void DogSonUpdate()
 			udpBegin = true;
 		}
 		else {
+			int packetSize = udpClient.parsePacket();
+			if (packetSize)
+			{
+				//Serial.print("Receive:");
+				byte buf[packetSize];
+				udpClient.read(buf, packetSize);
+				for (int i = 0; i < packetSize; i++)
+				{
+					//Serial.print(buf[i], HEX);
+					//Serial.print('.');
+					command.addData(buf[i]);
+				}
+				Serial.println();
+			}
+
 			if (nodeLoopPtr != NULL)
 			{
 				nodeLoopPtr();
