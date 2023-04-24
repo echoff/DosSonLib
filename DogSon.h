@@ -3,8 +3,10 @@
 #ifndef _DOGSON_h
 #define _DOGSON_h
 
-
+#define DOGSONVER 0x13
 #define ControlBaud 256000
+#define ReconnWiFiTimes 3
+#define ReconnWiFiInterval 10000 //重连WIFI间隔时间
 
 #if defined(ARDUINO) && ARDUINO >= 100
 #include "arduino.h"
@@ -34,6 +36,20 @@ byte group, nodeid;
 byte ip0, ip1, ip2, ip3;//ip地址
 ushort port;//端口
 String ssid, pass;//wifi 信息
+
+byte reconnectWIFICount = 0;
+/// <summary>
+/// 心跳发送间隔
+/// </summary>
+byte heartbeatPacketInterval;
+/// <summary>
+/// 重新链接wifi间隔计时器
+/// </summary>
+unsigned long reconnectWIFITimer = 0;
+/// <summary>
+/// 心跳包发送间隔计时器
+/// </summary>
+unsigned long sendHeartbeatPacketTimer = 0;
 
 static CxgCommand command;
 #if defined USEUDP
@@ -65,6 +81,10 @@ void Setting();
 
 void DogSonSetup()
 {
+#ifdef USEBatA0
+	pinMode(A0, INPUT);
+#endif
+
 	//-------------------存储相关------------------------
 	EEPROMInit();
 	ReadNodeID();
@@ -73,12 +93,10 @@ void DogSonSetup()
 
 	//-------------------串口相关------------------------
 	Serial.begin(ControlBaud);
-	Serial.println("----------------INFO--------------------");
-	Serial.print("DODSON:");
-	Serial.println(VER);
-	Serial.printf("\n Group:%u NodeID:%u\n", group, nodeid);
-	Serial.printf("\n WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
-	Serial.printf("\n IP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
+	Serial.printf("DODSON:%X,NODE:%X\n", DOGSONVER, VER);
+	Serial.printf("Group:%u NodeID:%u\n", group, nodeid);
+	Serial.printf("WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
+	Serial.printf("ServerIP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
 
 
 	//-------------------WIFI相关------------------------
@@ -112,11 +130,56 @@ void DogSonSetup()
 		{
 			onMsgPrt(cmdData, length);
 		}
-
-		if (length == 1 && cmdData[0] == 1)
+		//0x00 请求RSSI信息
+		if (length == 1)
 		{
-			byte selfData[1] = { WiFi.RSSI() };
-			command.sendCommand(selfData, 1);
+			byte cmdType = cmdData[0];
+			byte selfData[10];
+			switch (cmdType)
+			{
+			case 0x1:
+				selfData[0] = HARDWARETYPE;
+				selfData[1] = group;
+				selfData[2] = nodeid;
+				selfData[3] = 0x01;
+				selfData[4] = WiFi.RSSI();
+				command.sendCommand(selfData, 5);
+				break;
+			case 0x3:
+				selfData[0] = HARDWARETYPE;
+				selfData[1] = group;
+				selfData[2] = nodeid;
+				selfData[3] = 0x03;
+				selfData[4] = VER;
+				command.sendCommand(selfData, 5);
+				break;
+			case 0x4:
+				selfData[0] = HARDWARETYPE;
+				selfData[1] = group;
+				selfData[2] = nodeid;
+				selfData[3] = 0x04;
+				selfData[4] = DOGSONVER;
+				command.sendCommand(selfData, 5);
+				break;
+#ifdef USEBatA0
+			case 0x5:
+				uint32_t Vbatt = 0;
+				for (int i = 0; i < 16; i++) {
+					Vbatt = Vbatt + analogReadMilliVolts(A0); // ADC with correction   
+				}
+				float Vbattf = 2 * Vbatt / 16 / 1000.0;     // attenuation ratio 1/2, mV --> V
+				selfData[0] = HARDWARETYPE;
+				selfData[1] = group;
+				selfData[2] = nodeid;
+				selfData[3] = 0x05;
+				selfData[4] = *((byte*)(&Vbattf)+0);
+				selfData[5] = *((byte*)(&Vbattf)+1);
+				selfData[6] = *((byte*)(&Vbattf)+2);
+				selfData[7] = *((byte*)(&Vbattf)+3);
+				command.sendCommand(selfData, 8);
+				break;
+#endif
+			}
 		}
 		});
 
@@ -144,6 +207,7 @@ void DogSonUpdate()
 			udpBegin = true;
 		}
 		else {
+			//读取UDP数据
 			int packetSize = udpClient.parsePacket();
 			if (packetSize)
 			{
@@ -158,11 +222,24 @@ void DogSonUpdate()
 				}
 				Serial.println();
 			}
+			//发送心跳包
+			if (heartbeatPacketInterval > 0)
+			{
+				unsigned long currentMillis = millis();
+				if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval*1000)
+				{
+					byte selfData[5] = { HARDWARETYPE,group,nodeid,0xAA,WiFi.RSSI() };
+					command.sendCommand(selfData, 5);
+					sendHeartbeatPacketTimer = currentMillis;
+				}
+			}
 
+			//调用客户循环
 			if (nodeLoopPtr != NULL)
 			{
 				nodeLoopPtr();
 			}
+			//调用设置方法
 			Setting();
 		}
 
@@ -186,6 +263,17 @@ void DogSonUpdate()
 				{
 					nodeLoopPtr();
 				}
+				//发送心跳包
+				if (heartbeatPacketInterval > 0)
+				{
+					unsigned long currentMillis = millis();
+					if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval*1000)
+					{
+						byte selfData[5] = { HARDWARETYPE,group,nodeid,0xAA,WiFi.RSSI() };
+						command.sendCommand(selfData, 5);
+						sendHeartbeatPacketTimer = currentMillis;
+					}
+				}
 				Setting();
 			}
 			Serial.println("Connect closed!");
@@ -202,39 +290,39 @@ void DogSonUpdate()
 	}
 	else {//wifi没有连接的情况
 		Setting();
+		unsigned long currentMillis = millis();
+		// 定时重连
+		if (currentMillis - reconnectWIFITimer >= ReconnWiFiInterval) {
+			if (reconnectWIFICount >= ReconnWiFiTimes)
+			{
+				reconnectWIFICount = 0;
+				ESP.restart();
+			}
+			else {
+				reconnectWIFICount++;
+				Serial.println("Reconnecting to WiFi...");
+				WiFi.begin(ssid.c_str(), pass.c_str());
+				reconnectWIFITimer = currentMillis;
+			}
+		}
 	}
 }
 
 void EEPROMInit()
 {
 	if (!NODEID.begin(50)) {
-		Serial.println("Failed to initialise WIFIPass");
-		Serial.println("Restarting...");
-		delay(1000);
 		ESP.restart();
 	}
 	if (!IPAndPort.begin(50)) {
-		Serial.println("Failed to initialise IPAndPort");
-		Serial.println("Restarting...");
-		delay(1000);
 		ESP.restart();
 	}
 	if (!WIFIName.begin(50)) {
-		Serial.println("Failed to initialise WIFIName");
-		Serial.println("Restarting...");
-		delay(1000);
 		ESP.restart();
 	}
 	if (!WIFIPass.begin(50)) {
-		Serial.println("Failed to initialise WIFIPass");
-		Serial.println("Restarting...");
-		delay(1000);
 		ESP.restart();
 	}
 	if (!CustomSave.begin(50)) {
-		Serial.println("Failed to initialise WIFIPass");
-		Serial.println("Restarting...");
-		delay(1000);
 		ESP.restart();
 	}
 }
@@ -262,6 +350,7 @@ void ReadNodeID()
 {
 	NODEID.get(0, group);
 	NODEID.get(1, nodeid);
+	NODEID.get(2, heartbeatPacketInterval);
 }
 
 void SaveWifi()
@@ -289,6 +378,7 @@ void SaveNodeID()
 {
 	NODEID.put(0, group);
 	NODEID.put(1, nodeid);
+	NODEID.put(2, heartbeatPacketInterval);
 	NODEID.commit();
 }
 
@@ -334,24 +424,31 @@ void Setting()
 		case 'G':
 			Serial.printf("\n G? Set Group And NodeID\n");
 			while (Serial.read() != -1); // discard all other received characters
-			Serial.printf("\nEnter <group.nodeid> (with the <>!)\n");
+			Serial.printf("\nEnter <group.nodeid.heartbeatPacketInterval> (with the <>!)\n");
 			while (not Serial.available());
 			// read in the user input
 			Serial.readStringUntil('<');
 			group = Serial.readStringUntil('.').toInt();
-			nodeid = Serial.readStringUntil('>').toInt();
+			nodeid = Serial.readStringUntil('.').toInt();
+			heartbeatPacketInterval = Serial.readStringUntil('>').toInt();
 			while (Serial.read() != -1); // discard the rest of the input
-			Serial.printf("\n Group:%u NodeID:%u\n", group, nodeid);
+			Serial.printf("\n Group:%u NodeID:%u HeartbeatPacketInterval:%u\n", group, nodeid, heartbeatPacketInterval);
 			SaveNodeID();
 			break;
 		case 'I'://get info
 			Serial.printf("\n I? Info\n");
 			while (Serial.read() != -1); // discard all other received characters
-			Serial.printf("\n Group:%u NodeID:%u\n", group, nodeid);
-			Serial.printf("\n WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
-			Serial.printf("\n WIFI Status:%u LocalIP:%s\n", WiFi.status(), WiFi.localIP().toString());
-			Serial.printf("\n RSSI:%d\n", WiFi.RSSI());
-			Serial.printf("\n IP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
+			uint64_t chipid;
+			chipid = ESP.getEfuseMac();
+			Serial.printf("ESP32 Chip ID = %04X", (uint16_t)(chipid >> 32)); //print High 2 bytes
+			Serial.printf("%08X\n", (uint32_t)chipid); //print Low 4bytes.
+			Serial.printf("DODSON:%X,NODE:%X\n", DOGSONVER, VER);
+			Serial.printf("Group:%u NodeID:%u HPI:%u\n", group, nodeid, heartbeatPacketInterval);
+			Serial.printf("WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
+			Serial.printf("WIFI Status:%u LocalIP:%s\n", WiFi.status(), WiFi.localIP().toString());
+			Serial.printf("RSSI:%d\n", WiFi.RSSI());
+			Serial.printf("IP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
+
 			if (customInfoPrt != NULL)
 			{
 				customInfoPrt();
