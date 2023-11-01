@@ -3,7 +3,7 @@
 #ifndef _DOGSON_h
 #define _DOGSON_h
 
-#define DOGSONVER 0x13
+#define DOGSONVER 0x14
 #define ControlBaud 256000
 #define ReconnWiFiTimes 3
 #define ReconnWiFiInterval 10000 //重连WIFI间隔时间
@@ -24,6 +24,28 @@
 #include <cxg_Command.h>
 #include <EEPROM.h>
 
+#if defined USEBtn
+#include <Bounce2.h>
+Bounce2::Button button = Bounce2::Button();
+#endif
+
+#if defined USERGBLED
+	#if defined NEWBORAD
+	uint8_t ledr=64, ledg=0, ledb=0;
+	#else
+	#include <Adafruit_NeoPixel.h>
+	Adafruit_NeoPixel pixels(1, D3, NEO_GRB + NEO_KHZ800);
+	uint32_t ledRedColor = pixels.Color(100, 0, 0);
+	uint32_t ledGreenColor = pixels.Color(0, 100, 0);
+	uint32_t ledYellowColor = pixels.Color(100, 100, 0);
+	uint32_t ledColor = ledRedColor;
+	#endif
+
+bool rgbLedOn = false;
+unsigned long rgbLedBlinkTimer = 0;
+byte ledBlinkCount = 0;
+byte ledBlinkNum = 0;
+#endif
 
 EEPROMClass  IPAndPort("eeprom0");
 EEPROMClass  WIFIName("eeprom1");
@@ -78,6 +100,11 @@ void SaveNodeID();
 void SaveServer();
 
 void Setting();
+void WiFiEvent(WiFiEvent_t);
+
+#ifdef USEBatA0
+float GetBat();
+#endif
 
 void DogSonSetup()
 {
@@ -85,6 +112,22 @@ void DogSonSetup()
 	pinMode(A0, INPUT);
 #endif
 
+#if defined USERGBLED
+	#if defined NEWBORAD
+		digitalWrite(RGB_BUILTIN, HIGH);
+	#else
+		pixels.begin();
+		pixels.setPixelColor(0, pixels.Color(10,10,10));
+		pixels.show();
+	#endif
+#endif
+
+#if defined USEBtn
+	//pinMode(D1, INPUT_PULLUP);
+	button.attach(9, INPUT_PULLUP);
+	button.interval(5);
+	button.setPressedState(LOW);
+#endif
 	//-------------------存储相关------------------------
 	EEPROMInit();
 	ReadNodeID();
@@ -94,6 +137,7 @@ void DogSonSetup()
 	//-------------------串口相关------------------------
 	Serial.begin(ControlBaud);
 	Serial.printf("DODSON:%X,NODE:%X\n", DOGSONVER, VER);
+	Serial.printf("HW:%X\n", HARDWARETYPE);
 	Serial.printf("Group:%u NodeID:%u\n", group, nodeid);
 	Serial.printf("WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
 	Serial.printf("ServerIP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
@@ -101,12 +145,20 @@ void DogSonSetup()
 
 	//-------------------WIFI相关------------------------
 	WiFi.mode(WIFI_STA);
-	WiFi.setSleep(true); //关闭STA模式下wifi休眠，提高响应速度
+#ifdef SAVE_POWER
+	WiFi.setSleep(true);
+#else
+	WiFi.setSleep(false); //关闭STA模式下wifi休眠，提高响应速度
+#endif // SAVE_POWER
+
+	
+	WiFi.onEvent(WiFiEvent);
+
 
 	WiFi.begin(ssid.c_str(), pass.c_str()); //连接网络
 
 	//-------------------命令协议相关------------------------
-	command.setBufferSize(20);//设置缓冲区大小, 预计指令的最大的长度
+	command.setBufferSize(512);//设置缓冲区大小, 预计指令的最大的长度
 	byte start[2] = { 0xff, 0xfe };
 	command.setStart(start, 2);//设置开始指令开始的匹配
 	byte end[2] = { 0xfd, 0xfc };
@@ -115,13 +167,12 @@ void DogSonSetup()
 	//设置指令处理回调
 	command.setResolveCommandCallback([](byte* buff, int startIndex, int length) {
 		int endIndex = startIndex + length;
-		Serial.print("receive Command: ");
-
+		/*Serial.print("receive Command: ");
 		for (int i = startIndex; i < endIndex; i++) {
 			Serial.print(*(buff + i), HEX);
 			Serial.print(" ");
 		}
-		Serial.println("\n");
+		Serial.println("\n");*/
 
 		byte cmdData[length];
 		memcpy(cmdData, buff + startIndex, length);
@@ -130,58 +181,61 @@ void DogSonSetup()
 		{
 			onMsgPrt(cmdData, length);
 		}
-		//0x00 请求RSSI信息
-		if (length == 1)
+
+		byte cmdType = cmdData[0];
+
+		byte selfData[10];
+		switch (cmdType)
 		{
-			byte cmdType = cmdData[0];
-			byte selfData[10];
-			switch (cmdType)
-			{
-			case 0x1:
-				selfData[0] = HARDWARETYPE;
-				selfData[1] = group;
-				selfData[2] = nodeid;
-				selfData[3] = 0x01;
-				selfData[4] = WiFi.RSSI();
-				command.sendCommand(selfData, 5);
-				break;
-			case 0x3:
-				selfData[0] = HARDWARETYPE;
-				selfData[1] = group;
-				selfData[2] = nodeid;
-				selfData[3] = 0x03;
-				selfData[4] = VER;
-				command.sendCommand(selfData, 5);
-				break;
-			case 0x4:
-				selfData[0] = HARDWARETYPE;
-				selfData[1] = group;
-				selfData[2] = nodeid;
-				selfData[3] = 0x04;
-				selfData[4] = DOGSONVER;
-				command.sendCommand(selfData, 5);
-				break;
+		case 0x1:
+			selfData[0] = HARDWARETYPE;
+			selfData[1] = group;
+			selfData[2] = nodeid;
+			selfData[3] = 0x01;
+			selfData[4] = WiFi.RSSI();
+			command.sendCommand(selfData, 5);
+			break;
+		case 0x3:
+			selfData[0] = HARDWARETYPE;
+			selfData[1] = group;
+			selfData[2] = nodeid;
+			selfData[3] = 0x03;
+			selfData[4] = VER;
+			command.sendCommand(selfData, 5);
+			break;
+		case 0x4:
+			selfData[0] = HARDWARETYPE;
+			selfData[1] = group;
+			selfData[2] = nodeid;
+			selfData[3] = 0x04;
+			selfData[4] = DOGSONVER;
+			command.sendCommand(selfData, 5);
+			break;
 #ifdef USEBatA0
-			case 0x5:
-				uint32_t Vbatt = 0;
-				for (int i = 0; i < 16; i++) {
-					Vbatt = Vbatt + analogReadMilliVolts(A0); // ADC with correction   
-				}
-				float Vbattf = 2 * Vbatt / 16 / 1000.0;     // attenuation ratio 1/2, mV --> V
-				selfData[0] = HARDWARETYPE;
-				selfData[1] = group;
-				selfData[2] = nodeid;
-				selfData[3] = 0x05;
-				selfData[4] = *((byte*)(&Vbattf)+0);
-				selfData[5] = *((byte*)(&Vbattf)+1);
-				selfData[6] = *((byte*)(&Vbattf)+2);
-				selfData[7] = *((byte*)(&Vbattf)+3);
-				command.sendCommand(selfData, 8);
-				break;
+		case 0x5:
+			float Vbattf = GetBat();
+			selfData[0] = HARDWARETYPE;
+			selfData[1] = group;
+			selfData[2] = nodeid;
+			selfData[3] = 0x05;
+			selfData[4] = *((byte*)(&Vbattf) + 0);
+			selfData[5] = *((byte*)(&Vbattf) + 1);
+			selfData[6] = *((byte*)(&Vbattf) + 2);
+			selfData[7] = *((byte*)(&Vbattf) + 3);
+			command.sendCommand(selfData, 8);
+			break;
 #endif
-			}
+		case 0x6:
+			ip0 = cmdData[1];
+			ip1 = cmdData[2];
+			ip2 = cmdData[3];
+			ip3 = cmdData[4];
+			port = (cmdData[5] << 8) | cmdData[6];
+			Serial.printf("\n IP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
+			SaveServer();
+			break;
 		}
-		});
+	});
 
 	//设置发送数据的回调实现
 	command.setSendCommandCallback([](byte* buff, int length) {
@@ -198,6 +252,16 @@ void DogSonSetup()
 
 void DogSonUpdate()
 {
+#if defined USEBtn
+	button.update();
+	if (button.pressed()) {
+		Serial.println("Btn Trigger");
+		ledBlinkNum = 3;
+		rgbLedBlinkTimer = 0;
+		ledBlinkCount = 0;
+	}
+#endif
+
 	if (WiFi.status() == WL_CONNECTED)//连接成功的情况
 	{
 #if defined USEUDP
@@ -212,24 +276,43 @@ void DogSonUpdate()
 			if (packetSize)
 			{
 				//Serial.print("Receive:");
-				byte buf[packetSize];
+				uint8_t buf[packetSize];
 				udpClient.read(buf, packetSize);
+				//udpClient.readBytes(buf, packetSize);
 				for (int i = 0; i < packetSize; i++)
 				{
 					//Serial.print(buf[i], HEX);
 					//Serial.print('.');
 					command.addData(buf[i]);
 				}
-				Serial.println();
+				//Serial.println();
 			}
 			//发送心跳包
 			if (heartbeatPacketInterval > 0)
 			{
 				unsigned long currentMillis = millis();
-				if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval*1000)
+				if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval * 1000)
 				{
+#ifdef  USEBatA0 
+#ifdef REPORTBat
+
+					float Vbattf = GetBat();
+					byte selfData[9];
+					selfData[0] = HARDWARETYPE;
+					selfData[1] = group;
+					selfData[2] = nodeid;
+					selfData[3] = 0xAA;
+					selfData[4] = WiFi.RSSI();
+					selfData[5] = *((byte*)(&Vbattf) + 0);
+					selfData[6] = *((byte*)(&Vbattf) + 1);
+					selfData[7] = *((byte*)(&Vbattf) + 2);
+					selfData[8] = *((byte*)(&Vbattf) + 3);
+					command.sendCommand(selfData, 9);
+#endif
+#else
 					byte selfData[5] = { HARDWARETYPE,group,nodeid,0xAA,WiFi.RSSI() };
 					command.sendCommand(selfData, 5);
+#endif 
 					sendHeartbeatPacketTimer = currentMillis;
 				}
 			}
@@ -244,12 +327,13 @@ void DogSonUpdate()
 		}
 
 #else
+		
 		IPAddress serverIP(ip0, ip1, ip2, ip3);
 		if (client.connect(serverIP, port)) //尝试访问目标地址
 		{
 			Serial.println("Connect success!");
-			//client.print("Hello world!");                    //向服务器发送数据
-
+			//client.print("Hello world!");    
+			//向服务器发送数据
 			while (client.connected() || client.available()) //如果已连接或有收到的未读取的数据
 			{
 				if (client.available()) //如果有数据可读取
@@ -267,7 +351,7 @@ void DogSonUpdate()
 				if (heartbeatPacketInterval > 0)
 				{
 					unsigned long currentMillis = millis();
-					if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval*1000)
+					if (currentMillis - sendHeartbeatPacketTimer >= heartbeatPacketInterval * 1000)
 					{
 						byte selfData[5] = { HARDWARETYPE,group,nodeid,0xAA,WiFi.RSSI() };
 						command.sendCommand(selfData, 5);
@@ -296,6 +380,7 @@ void DogSonUpdate()
 			if (reconnectWIFICount >= ReconnWiFiTimes)
 			{
 				reconnectWIFICount = 0;
+				Serial.println("Restart...");
 				ESP.restart();
 			}
 			else {
@@ -306,6 +391,35 @@ void DogSonUpdate()
 			}
 		}
 	}
+#if defined USERGBLED
+	if (ledBlinkCount < ledBlinkNum)
+	{
+		if (millis() - rgbLedBlinkTimer > 300)
+		{
+			if (rgbLedOn)
+			{
+				#if defined NEWBORAD
+				neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+				#else
+				pixels.setPixelColor(0, 0);
+				pixels.show();
+				#endif
+				rgbLedOn = false;
+				ledBlinkCount++;
+			}
+			else {
+				#if defined NEWBORAD
+				neopixelWrite(RGB_BUILTIN,ledr,ledg,ledb);
+				#else
+				pixels.setPixelColor(0, ledColor);
+				pixels.show();
+				#endif
+				rgbLedOn = true;
+			}
+			rgbLedBlinkTimer = millis();
+		}		
+	}
+#endif
 }
 
 void EEPROMInit()
@@ -372,6 +486,8 @@ void SaveServer()
 	IPAndPort.put(4, portH);
 	IPAndPort.put(5, portL);
 	IPAndPort.commit();
+
+	ESP.restart();
 }
 
 void SaveNodeID()
@@ -396,7 +512,7 @@ void Setting()
 			Serial.printf("\n W? Change Wifi SSID Password!\n");
 			while (Serial.read() != -1); // discard all other received characters
 			Serial.printf("\nEnter <SSID Password> (with the <>!)\n");
-			while (not Serial.available());
+			while (Serial.available()==0);
 			// read in the user input
 			Serial.readStringUntil('<'); // ignore everything up to <  (SSID will be overwritten next)
 			ssid = Serial.readStringUntil(' ');        // store SSID
@@ -409,7 +525,7 @@ void Setting()
 			Serial.printf("\n W? Change ServerIP and Port!\n");
 			while (Serial.read() != -1); // discard all other received characters
 			Serial.printf("\nEnter <xxx.xxx.xxx.xxx:Port> (with the <>!)\n");
-			while (not Serial.available());
+			while (Serial.available()==0);
 			// read in the user input
 			Serial.readStringUntil('<');
 			ip0 = Serial.readStringUntil('.').toInt();        // 存储ip地址
@@ -425,7 +541,7 @@ void Setting()
 			Serial.printf("\n G? Set Group And NodeID\n");
 			while (Serial.read() != -1); // discard all other received characters
 			Serial.printf("\nEnter <group.nodeid.heartbeatPacketInterval> (with the <>!)\n");
-			while (not Serial.available());
+			while (Serial.available()==0);
 			// read in the user input
 			Serial.readStringUntil('<');
 			group = Serial.readStringUntil('.').toInt();
@@ -436,18 +552,21 @@ void Setting()
 			SaveNodeID();
 			break;
 		case 'I'://get info
-			Serial.printf("\n I? Info\n");
+			Serial.println();
+			Serial.printf("====Info====\n");
 			while (Serial.read() != -1); // discard all other received characters
+			Serial.printf("HW:%X\n", HARDWARETYPE);
 			uint64_t chipid;
 			chipid = ESP.getEfuseMac();
-			Serial.printf("ESP32 Chip ID = %04X", (uint16_t)(chipid >> 32)); //print High 2 bytes
+			Serial.printf("ESP32 Chip ID = %04X", (ushort)(chipid >> 32)); //print High 2 bytes
 			Serial.printf("%08X\n", (uint32_t)chipid); //print Low 4bytes.
 			Serial.printf("DODSON:%X,NODE:%X\n", DOGSONVER, VER);
 			Serial.printf("Group:%u NodeID:%u HPI:%u\n", group, nodeid, heartbeatPacketInterval);
+			Serial.println("====WIFI====");
 			Serial.printf("WIFI: '%s'(%u), '%s'(%u)\n", ssid.c_str(), ssid.length(), pass.c_str(), pass.length());
-			Serial.printf("WIFI Status:%u LocalIP:%s\n", WiFi.status(), WiFi.localIP().toString());
-			Serial.printf("RSSI:%d\n", WiFi.RSSI());
-			Serial.printf("IP:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
+			Serial.printf("WIFI Status:%u LocalIP:%s RSSI:%d\n", WiFi.status(), WiFi.localIP().toString(), WiFi.RSSI());
+			Serial.println("====Server====");
+			Serial.printf("Server:%u.%u.%u.%u Port:%u\n", ip0, ip1, ip2, ip3, port);
 
 			if (customInfoPrt != NULL)
 			{
@@ -470,6 +589,112 @@ void Setting()
 		}
 	}
 }
+
+void WiFiEvent(WiFiEvent_t event)
+{
+	Serial.printf("[WiFi-event] event: %d\n", event);
+
+	switch (event) {
+	case SYSTEM_EVENT_WIFI_READY:
+		Serial.println("WiFi interface ready");
+		break;
+	case SYSTEM_EVENT_SCAN_DONE:
+		Serial.println("Completed scan for access points");
+		break;
+	case SYSTEM_EVENT_STA_START:
+		Serial.println("WiFi client started");
+		break;
+	case SYSTEM_EVENT_STA_STOP:
+		Serial.println("WiFi clients stopped");
+		break;
+	case SYSTEM_EVENT_STA_CONNECTED:
+		Serial.println("Connected to access point");
+#if defined USERGBLED
+		ledBlinkNum = 3;
+	#if defined NEWBORAD
+		ledr = 0;
+		ledg = 64;
+		ledb = 0;
+	#else
+		ledColor = ledGreenColor;
+	#endif
+#endif
+		break;
+	case SYSTEM_EVENT_STA_DISCONNECTED:
+		Serial.println("Disconnected from WiFi access point");
+		break;
+	case SYSTEM_EVENT_STA_AUTHMODE_CHANGE:
+		Serial.println("Authentication mode of access point has changed");
+		break;
+	case SYSTEM_EVENT_STA_GOT_IP:
+		Serial.print("Obtained IP address: ");
+		Serial.println(WiFi.localIP());
+		break;
+	case SYSTEM_EVENT_STA_LOST_IP:
+		Serial.println("Lost IP address and IP address is reset to 0");
+		break;
+	case SYSTEM_EVENT_STA_WPS_ER_SUCCESS:
+		Serial.println("WiFi Protected Setup (WPS): succeeded in enrollee mode");
+		break;
+	case SYSTEM_EVENT_STA_WPS_ER_FAILED:
+		Serial.println("WiFi Protected Setup (WPS): failed in enrollee mode");
+		break;
+	case SYSTEM_EVENT_STA_WPS_ER_TIMEOUT:
+		Serial.println("WiFi Protected Setup (WPS): timeout in enrollee mode");
+		break;
+	case SYSTEM_EVENT_STA_WPS_ER_PIN:
+		Serial.println("WiFi Protected Setup (WPS): pin code in enrollee mode");
+		break;
+	case SYSTEM_EVENT_AP_START:
+		Serial.println("WiFi access point started");
+		break;
+	case SYSTEM_EVENT_AP_STOP:
+		Serial.println("WiFi access point  stopped");
+		break;
+	case SYSTEM_EVENT_AP_STACONNECTED:
+		Serial.println("Client connected");
+		break;
+	case SYSTEM_EVENT_AP_STADISCONNECTED:
+		Serial.println("Client disconnected");
+		break;
+	case SYSTEM_EVENT_AP_STAIPASSIGNED:
+		Serial.println("Assigned IP address to client");
+		break;
+	case SYSTEM_EVENT_AP_PROBEREQRECVED:
+		Serial.println("Received probe request");
+		break;
+	case SYSTEM_EVENT_GOT_IP6:
+		Serial.println("IPv6 is preferred");
+		break;
+	case SYSTEM_EVENT_ETH_START:
+		Serial.println("Ethernet started");
+		break;
+	case SYSTEM_EVENT_ETH_STOP:
+		Serial.println("Ethernet stopped");
+		break;
+	case SYSTEM_EVENT_ETH_CONNECTED:
+		Serial.println("Ethernet connected");
+		break;
+	case SYSTEM_EVENT_ETH_DISCONNECTED:
+		Serial.println("Ethernet disconnected");
+		break;
+	case SYSTEM_EVENT_ETH_GOT_IP:
+		Serial.println("Obtained IP address");
+		break;
+	default: break;
+	}}
+
+#ifdef USEBatA0
+float GetBat()
+{
+	uint32_t Vbatt = 0;
+	for (int i = 0; i < 16; i++) {
+		Vbatt = Vbatt + analogReadMilliVolts(A0); // ADC with correction   
+	}
+	float Vbattf = 2 * Vbatt / 16 / 1000.0;     // attenuation ratio 1/2, mV --> V
+	return Vbattf;
+}
+#endif
 
 #endif
 
